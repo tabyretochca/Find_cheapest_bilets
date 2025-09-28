@@ -60,6 +60,7 @@ async def track_flight(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         db.close()
 
+
 async def check_prices(context: ContextTypes.DEFAULT_TYPE):
     """
     Периодическая задача для проверки цен на отслеживаемые рейсы.
@@ -68,8 +69,6 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
     try:
         flights_to_check = db.query(TrackedFlight).filter(TrackedFlight.notified == False).all()
         for flight in flights_to_check:
-            # Получаем IATA-коды городов, если API это требует (здесь для примера не реализовано)
-            # В этом примере Kiwi API может работать с названиями городов
             found_flight = find_cheapest_flight(
                 flight.origin, flight.destination, flight.departure_date, flight.return_date
             )
@@ -79,6 +78,7 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
                 if user:
                     message = (
                         f"🔥 Найдена выгодная цена! 🔥\n\n"
+                        f"Источник: {found_flight.get('source', 'Unknown')}\n"
                         f"Рейс: {found_flight['departure_city']} -> {found_flight['arrival_city']}\n"
                         f"Даты: {found_flight['departure_date']} - {found_flight['return_date']}\n"
                         f"Цена: {found_flight['price']} RUB\n\n"
@@ -86,7 +86,7 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
                     )
                     await context.bot.send_message(chat_id=user.chat_id, text=message)
                     
-                    flight.notified = True # Помечаем, чтобы не отправлять повторно
+                    flight.notified = True
                     db.commit()
     finally:
         db.close()

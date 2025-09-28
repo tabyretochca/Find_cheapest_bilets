@@ -1,30 +1,19 @@
-from telegram.ext import Application, CommandHandler
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from config import TELEGRAM_BOT_TOKEN
-from bot_handler import start, track_flight, check_prices
-from database import init_db
+import os
+from dotenv import load_dotenv
 
-def main():
-    # Инициализация базы данных
-    init_db()
+load_dotenv()
 
-    # Создание приложения бота
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+# Токен вашего Telegram-бота (получается у @BotFather)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 
-    # Добавление обработчиков команд
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("track", track_flight))
+# Ключ API для поиска авиабилетов (например, от Kiwi.com или SerpApi)
+FLIGHT_API_KEY = os.getenv("FLIGHT_API_KEY", "YOUR_FLIGHT_API_KEY")
 
-    # Настройка и запуск планировщика для периодической проверки цен
-    scheduler = AsyncIOScheduler()
-    # Проверять цены каждые 4 часа
-    scheduler.add_job(check_prices, 'interval', hours=4, args=[application])
-    scheduler.start()
-    
-    print("Бот запущен и готов к работе...")
-    
-    # Запуск бота
-    application.run_polling()
+# URL API для поиска
+FLIGHT_API_ENDPOINT = "https://tequila-api.kiwi.com/v2/search" # Пример для Kiwi.com
 
-if __name__ == '__main__':
-    main()
+# Travelpayouts marker для Aviasales API
+TRAVELPAYOUTS_MARKER = os.getenv("TRAVELPAYOUTS_MARKER", "YOUR_TRAVELPAYOUTS_MARKER")
+
+# Название файла базы данных
+DATABASE_FILE = "flights.db"
