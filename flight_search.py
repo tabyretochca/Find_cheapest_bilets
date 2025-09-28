@@ -142,36 +142,61 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 # --- ОБНОВЛЕННАЯ ФОНОВАЯ ЗАДАЧА ПРОВЕРКИ ЦЕН ---
-async def check_prices(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Начинаю плановую проверку цен по датам...")
+async def check_prices_combined(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Начинаю плановую проверку цен (комбинированный поиск)...")
     db = SessionLocal()
     try:
-        subscriptions = db.query(Subscription).all()
-        for sub in subscriptions:
-            flight = find_flight_for_dates(
-                sub.origin, sub.destination, sub.departure_date, sub.return_date, AVIASALES_API_TOKEN
-            )
+        # Группируем подписки по пользователю и датам
+        subscriptions_grouped = {}
+        for sub in db.query(Subscription).all():
+            key = (sub.chat_id, sub.departure_date, sub.return_date)
+            if key not in subscriptions_grouped:
+                subscriptions_grouped[key] = {}
+            subscriptions_grouped[key][sub.origin] = sub
+
+        for key, subs_by_origin in subscriptions_grouped.items():
+            chat_id, dep_date, ret_date = key
             
-            if flight and flight['price'] <= sub.price_threshold:
-                message = (
-                    f"🔥 Найдена выгодная цена на ваши даты! 🔥\n\n"
-                    f"✈️ **Маршрут:** {sub.origin} → {sub.destination}\n"
-                    f"🛫 **Вылет:** {sub.departure_date}\n"
-                    f"🛬 **Возврат:** {sub.return_date}\n"
-                    f"💰 **Цена:** {flight['price']} RUB\n\n"
-                    f"➡️ [Купить билет]({flight['link']})"
-                )
-                await context.bot.send_message(
-                    chat_id=sub.chat_id, text=message, parse_mode='Markdown'
-                )
-                # Удаляем подписку после уведомления, чтобы не спамить
-                db.delete(sub)
-        db.commit()
+            # Убеждаемся, что есть подписки в обе стороны
+            if "MOW" not in subs_by_origin or "MRV" not in subs_by_origin:
+                continue
+
+            # Ищем билеты в обе стороны
+            flight_to = find_flight_for_dates("MOW", "MRV", dep_date, ret_date, AVIASALES_API_TOKEN)
+            flight_from = find_flight_for_dates("MRV", "MOW", dep_date, ret_date, AVIASALES_API_TOKEN)
+
+            # Если найдены оба билета
+            if flight_to and flight_from:
+                total_price = flight_to['price'] + flight_from['price']
+                price_threshold = subs_by_origin["MOW"].price_threshold
+
+                # Если общая цена ниже порога
+                if total_price <= price_threshold:
+                    message = (
+                        f"🔥 **Найдена выгодная цена за оба билета!** 🔥\n\n"
+                        f"💰 **Общая цена: {total_price:.0f} RUB**\n"
+                        f"_(Ваш порог: {price_threshold:.0f} RUB)_\n\n"
+                        f"✈️ **Туда: MOW → MRV**\n"
+                        f"Цена: {flight_to['price']} RUB\n"
+                        f"➡️ [Купить билет туда]({flight_to['link']})\n\n"
+                        f"✈️ **Обратно: MRV → MOW**\n"
+                        f"Цена: {flight_from['price']} RUB\n"
+                        f"➡️ [Купить билет обратно]({flight_from['link']})"
+                    )
+
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=message, parse_mode='Markdown', disable_web_page_preview=True
+                    )
+
+                    # Удаляем обе подписки, чтобы больше не уведомлять
+                    db.delete(subs_by_origin["MOW"])
+                    db.delete(subs_by_origin["MRV"])
+                    db.commit()
     except Exception as e:
-        logger.error(f"Ошибка в задаче проверки цен: {e}")
+        logger.error(f"Ошибка в задаче комбинированной проверки цен: {e}")
     finally:
         db.close()
-        logger.info("Проверка цен по датам завершена.")
+        logger.info("Проверка цен (комбинированный поиск) завершена.")
 
 # --- ЗАПУСК БОТА (код остался таким же) ---
 async def main():
@@ -184,9 +209,9 @@ async def main():
     application.add_handler(CommandHandler("track", track)) 
 
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(check_prices, 'interval', minutes=5, args=[application])
+    scheduler.add_job(check_prices_combined, 'interval', minutes=3, args=[application])
     scheduler.start()
-    await check_prices(application) 
+    await check_prices_combined(application)
     
     logger.info("Бот запущен и готов к работе...")
     
