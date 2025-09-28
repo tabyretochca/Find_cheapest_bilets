@@ -184,7 +184,7 @@ async def main():
     application.add_handler(CommandHandler("track", track)) 
 
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(check_prices, 'interval', hours=4, args=[application])
+    scheduler.add_job(check_prices, 'interval', minutes=5, args=[application])
     scheduler.start()
     await check_prices(application) 
     
