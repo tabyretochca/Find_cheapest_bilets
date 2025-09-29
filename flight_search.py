@@ -115,7 +115,8 @@ async def fetch_flight_for_date(client: httpx.AsyncClient, origin, destination, 
                     "origin_airport": flight['origin_airport'],
                     "destination_airport": flight['destination_airport'],
                     "departure_date": flight['departure_at'].split('T')[0],
-                    "departure_time": flight['departure_at'].split('T')[1][:5] if 'T' in flight['departure_at'] else ''
+                    "departure_time": flight['departure_at'].split('T')[1][:5] if 'T' in flight['departure_at'] else '',
+                    "arrival_time": ''  # Нет в API, placeholder
                 }
                 for flight in data['data']
             ]
@@ -123,8 +124,8 @@ async def fetch_flight_for_date(client: httpx.AsyncClient, origin, destination, 
         logger.error(f"Ошибка для даты {date_str}: {e}")
     return []
 
-async def find_flights_for_dates(origin, destination, target_date_str, token, threshold, exact_only=False):
-    """Ищет билеты на target_date ±3 дня параллельно, или только на exact."""
+async def find_flights_for_dates(origin, destination, target_date_str, token, threshold, exact_only=False, apply_threshold=True):
+    """Ищет билеты на target_date ±3 дня параллельно, или только на exact. apply_threshold для фильтра по <= threshold."""
     try:
         target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
     except ValueError:
@@ -144,9 +145,25 @@ async def find_flights_for_dates(origin, destination, target_date_str, token, th
         if isinstance(res, list):
             all_flights.extend(res)
 
-    # Фильтруем по threshold, сортируем по цене, топ 5
-    filtered = sorted([f for f in all_flights if f['price'] <= threshold], key=lambda x: x['price'])
-    return filtered[:5]
+    # Фильтруем и сортируем по цене, затем по времени вылета
+    def get_minutes(time_str):
+        if not time_str:
+            return 0
+        h, m = map(int, time_str.split(':'))
+        return h * 60 + m
+
+    if apply_threshold:
+        filtered = sorted(
+            [f for f in all_flights if f['price'] <= threshold],
+            key=lambda x: (x['price'], get_minutes(x['departure_time']))
+        )
+    else:
+        filtered = sorted(
+            all_flights,
+            key=lambda x: (x['price'], get_minutes(x['departure_time']))
+        )
+    num_limit = 3 if exact_only else 5  # 3 для target, 5 для alt
+    return filtered[:num_limit]  # Top cheapest
 
 # --- ОБРАБОТЧИКИ КОМАНД БОТА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -215,7 +232,64 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Дешевле чем: {price_threshold} RUB"
         )
 
-        # Немедленная проверка
+        # Немедленная проверка после добавления
+        await check_prices(context.application)
+    finally:
+        db.close()
+
+async def update_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.message.chat_id)
+    args = context.args
+
+    if len(args) != 3:
+        await update.message.reply_text(
+            "Неверный формат. Пример:\n`/update 2025-10-15 2025-10-22 15000`"
+        )
+        return
+
+    depart_date_str, return_date_str, price_str = args
+
+    # Валидация данных
+    try:
+        datetime.strptime(depart_date_str, '%Y-%m-%d')
+        datetime.strptime(return_date_str, '%Y-%m-%d')
+    except ValueError:
+        await update.message.reply_text("Неверный формат даты. Используйте `ГГГГ-ММ-ДД`.")
+        return
+    
+    try:
+        price_threshold = float(price_str)
+    except ValueError:
+        await update.message.reply_text("Цена должна быть числом.")
+        return
+
+    db = SessionLocal()
+    try:
+        # Очищаем предыдущие подписки для этого chat_id
+        subscriptions = db.query(Subscription).filter_by(chat_id=chat_id).all()
+        for sub in subscriptions:
+            db.delete(sub)
+        db.commit()
+
+        # Добавляем новые подписки
+        sub_out = Subscription(
+            chat_id=chat_id, direction='outbound', target_date=depart_date_str, price_threshold=price_threshold
+        )
+        sub_ret = Subscription(
+            chat_id=chat_id, direction='return', target_date=return_date_str, price_threshold=price_threshold
+        )
+        db.add(sub_out)
+        db.add(sub_ret)
+        db.commit()
+
+        await update.message.reply_text(
+            f"Поиск обновлён! Новые параметры:\n"
+            f"🛫 Из Москвы: {format_date(depart_date_str)}\n"
+            f"🛬 Из Мин. Вод: {format_date(return_date_str)}\n"
+            f"💰 Дешевле чем: {price_threshold} RUB"
+        )
+
+        # Немедленная проверка с новыми параметрами
         await check_prices(context.application)
     finally:
         db.close()
@@ -235,12 +309,30 @@ async def check_prices(application: Application):
                 origin, destination = IATA_CODES["минеральные воды"], IATA_CODES["москва"]
                 route_name = "Из Мин. Вод в Москву"
 
-            # Сначала проверка на точную дату
+            # Сначала проверка на точную дату (filtered <= threshold)
             exact_flights = await find_flights_for_dates(
-                origin, destination, sub.target_date, AVIASALES_API_TOKEN, sub.price_threshold, exact_only=True
+                origin, destination, sub.target_date, AVIASALES_API_TOKEN, sub.price_threshold, exact_only=True, apply_threshold=True
             )
             
+            # Альтернативы без фильтра по threshold
+            alt_flights_unfiltered = await find_flights_for_dates(
+                origin, destination, sub.target_date, AVIASALES_API_TOKEN, sub.price_threshold, exact_only=False, apply_threshold=False
+            )
+            
+            alt_flights = []
             if exact_flights:
+                min_exact = min(f['price'] for f in exact_flights)
+                alt_flights = [f for f in alt_flights_unfiltered if f['price'] < min_exact and f['price'] <= sub.price_threshold]
+                alt_flights = sorted(alt_flights, key=lambda x: x['price'])[:5]
+                alt_header = "🛫 Дешевле альтернативы в ближайшие дни:"
+            else:
+                alt_flights = sorted([f for f in alt_flights_unfiltered if f['price'] <= sub.price_threshold], key=lambda x: x['price'])[:5]
+                alt_header = "🛫 На целевую дату ничего подходящего, но вот альтернативы:"
+
+            found_something = False
+
+            if exact_flights:
+                found_something = True
                 message_parts = [
                     f"🔥 Найдены выгодные предложения для {route_name}! 🔥\n\n"
                     f"Дата: {format_date(sub.target_date)}\n\n"
@@ -261,15 +353,9 @@ async def check_prices(application: Application):
                     chat_id=sub.chat_id, text=message, parse_mode='Markdown'
                 )
 
-            # Затем альтернативы (±3 дня, исключая target)
-            alt_flights = await find_flights_for_dates(
-                origin, destination, sub.target_date, AVIASALES_API_TOKEN, sub.price_threshold, exact_only=False
-            )
-            
             if alt_flights:
-                message_parts = [
-                    f"🛫 Альтернативы в ближайшие дни для {route_name}:"
-                ]
+                found_something = True
+                message_parts = [alt_header]
                 for flight in alt_flights:
                     airline_name = AIRLINE_NAMES.get(flight['airline'], flight['airline'])
                     orig_airport = AIRPORT_NAMES.get(flight['origin_airport'], flight['origin_airport'])
@@ -286,8 +372,8 @@ async def check_prices(application: Application):
                     chat_id=sub.chat_id, text=message, parse_mode='Markdown'
                 )
 
-            # Удаляем подписку, если найдены предложения (exact или alt)
-            if exact_flights or alt_flights:
+            # Удаляем подписку, если что-то найдено
+            if found_something:
                 db.delete(sub)
         db.commit()
     except Exception as e:
@@ -304,10 +390,11 @@ async def main():
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("track", track)) 
+    application.add_handler(CommandHandler("track", track))
+    application.add_handler(CommandHandler("update", update_search))  # Новая команда для обновления
 
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(check_prices, 'interval', minutes=5, args=[application])  # Для теста, потом hours=4
+    scheduler.add_job(check_prices, 'interval', minutes=5, args=[application])  # Для теста minutes=5, потом hours=4
     scheduler.start()
     
     logger.info("Бот запущен и готов к работе...")
